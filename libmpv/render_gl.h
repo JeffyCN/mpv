@@ -175,6 +175,9 @@ typedef struct mpv_opengl_drm_params {
      * Set to a negative number if invalid.
      */
     int render_fd;
+
+    int x;
+    int y;
 } mpv_opengl_drm_params;
 
 typedef struct mpv_opengl_drm_osd_size {

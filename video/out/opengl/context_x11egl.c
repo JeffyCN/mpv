@@ -31,16 +31,45 @@
 #include "context.h"
 #include "egl_helpers.h"
 
+#if HAVE_DRM
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include "libmpv/render_gl.h"
+#include "video/out/drm_common.h"
+#endif
+
 struct priv {
     GL gl;
     EGLDisplay egl_display;
     EGLContext egl_context;
     EGLSurface egl_surface;
+
+#if HAVE_DRM
+    struct kms *kms;
+    struct mpv_opengl_drm_params drm_params;
+
+    int x;
+    int y;
+#endif
 };
 
 static void mpegl_uninit(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
+
+#if HAVE_DRM
+    struct drm_atomic_context *atomic_ctx = p->kms->atomic_context;
+
+    if (atomic_ctx) {
+        int ret = drmModeAtomicCommit(p->kms->fd, atomic_ctx->request, 0, NULL);
+        if (ret)
+            MP_ERR(ctx->vo, "Failed to commit atomic request (%d)\n", ret);
+        drmModeAtomicFree(atomic_ctx->request);
+    }
+#endif
+
     ra_gl_ctx_uninit(ctx);
 
     if (p->egl_context) {
@@ -49,7 +78,20 @@ static void mpegl_uninit(struct ra_ctx *ctx)
         eglDestroyContext(p->egl_display, p->egl_context);
     }
     p->egl_context = EGL_NO_CONTEXT;
+    if (p->egl_display != EGL_NO_DISPLAY)
+        eglTerminate(p->egl_display);
+    p->egl_display = EGL_NO_DISPLAY;
+
     vo_x11_uninit(ctx->vo);
+
+#if HAVE_DRM
+    close(p->drm_params.render_fd);
+
+    if (p->kms) {
+        kms_destroy(p->kms);
+        p->kms = 0;
+    }
+#endif
 }
 
 static int pick_xrgba_config(void *user_data, EGLConfig *configs, int num_configs)
@@ -75,9 +117,65 @@ static int pick_xrgba_config(void *user_data, EGLConfig *configs, int num_config
     return 0;
 }
 
+#if HAVE_DRM
+static bool mpegl_update_position(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    struct vo_x11_state *x11 = ctx->vo->x11;
+    int x = 0, y = 0;
+    bool moved = false;
+    Window dummy_win;
+    Window win = x11->parent ? x11->parent : x11->window;
+
+    if (win)
+        XTranslateCoordinates(x11->display, win, x11->rootwin, 0, 0,
+                              &x, &y, &dummy_win);
+
+    moved = p->x != x || p->y != y;
+    p->drm_params.x = p->x = x;
+    p->drm_params.y = p->y = y;
+
+    return moved;
+}
+
+static bool drm_atomic_egl_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
+{
+    struct priv *p = sw->ctx->priv;
+
+    mpegl_update_position(sw->ctx);
+
+    if (p->kms->atomic_context) {
+        if (!p->kms->atomic_context->request) {
+            p->kms->atomic_context->request = drmModeAtomicAlloc();
+            p->drm_params.atomic_request_ptr = &p->kms->atomic_context->request;
+        }
+        return ra_gl_ctx_start_frame(sw, out_fbo);
+    }
+    return false;
+}
+
+static const struct ra_swapchain_fns drm_atomic_swapchain = {
+    .start_frame   = drm_atomic_egl_start_frame,
+};
+#endif
+
 static void mpegl_swap_buffers(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
+#if HAVE_DRM
+    struct drm_atomic_context *atomic_ctx = p->kms->atomic_context;
+    int ret;
+
+    if (atomic_ctx) {
+        ret = drmModeAtomicCommit(p->kms->fd, atomic_ctx->request, 0, NULL);
+        if (ret)
+            MP_WARN(ctx->vo, "Failed to commit atomic request (%d)\n", ret);
+
+        drmModeAtomicFree(atomic_ctx->request);
+        atomic_ctx->request = drmModeAtomicAlloc();
+    }
+#endif
+
     eglSwapBuffers(p->egl_display, p->egl_surface);
 }
 
@@ -140,14 +238,55 @@ static bool mpegl_init(struct ra_ctx *ctx)
 
     mpegl_load_functions(&p->gl, ctx->log);
 
+#if HAVE_DRM
+    MP_VERBOSE(ctx, "Initializing KMS\n");
+    p->kms = kms_create(ctx->log, ctx->vo->opts->drm_opts->drm_connector_spec,
+                        ctx->vo->opts->drm_opts->drm_mode_id,
+                        ctx->vo->opts->drm_opts->drm_osd_plane_id,
+                        ctx->vo->opts->drm_opts->drm_video_plane_id);
+    if (!p->kms) {
+        MP_ERR(ctx, "Failed to create KMS.\n");
+        return false;
+    }
+
+    p->drm_params.fd = p->kms->fd;
+    p->drm_params.crtc_id = p->kms->crtc_id;
+    p->drm_params.connector_id = p->kms->connector->connector_id;
+    if (p->kms->atomic_context)
+        p->drm_params.atomic_request_ptr = &p->kms->atomic_context->request;
+    char *rendernode_path = drmGetRenderDeviceNameFromFd(p->kms->fd);
+    if (rendernode_path) {
+        MP_VERBOSE(ctx, "Opening render node \"%s\"\n", rendernode_path);
+        p->drm_params.render_fd = open(rendernode_path, O_RDWR | O_CLOEXEC);
+        if (p->drm_params.render_fd < 0) {
+            MP_WARN(ctx, "Cannot open render node \"%s\": %s. VAAPI hwdec will be disabled\n",
+                    rendernode_path, mp_strerror(errno));
+        }
+        free(rendernode_path);
+    } else {
+        p->drm_params.render_fd = -1;
+        MP_VERBOSE(ctx, "Could not find path to render node. VAAPI hwdec will be disabled\n");
+    }
+
+    struct ra_gl_ctx_params params = {
+        .swap_buffers = mpegl_swap_buffers,
+        .external_swapchain = p->kms->atomic_context ? &drm_atomic_swapchain :
+                                                       NULL,
+    };
+#else
     struct ra_gl_ctx_params params = {
         .swap_buffers = mpegl_swap_buffers,
     };
+#endif
 
     if (!ra_gl_ctx_init(ctx, &p->gl, params))
         goto uninit;
 
     ra_add_native_resource(ctx->ra, "x11", vo->x11->display);
+
+#if HAVE_DRM
+    ra_add_native_resource(ctx->ra, "drm_params", &p->drm_params);
+#endif
 
     return true;
 
@@ -174,6 +313,12 @@ static int mpegl_control(struct ra_ctx *ctx, int *events, int request,
     int ret = vo_x11_control(ctx->vo, events, request, arg);
     if (*events & VO_EVENT_RESIZE)
         resize(ctx);
+
+#if HAVE_DRM
+    if (mpegl_update_position(ctx))
+        ctx->vo->want_redraw = true;
+#endif
+
     return ret;
 }
 
