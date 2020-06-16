@@ -201,6 +201,9 @@ typedef struct mpv_opengl_drm_params_v2 {
      * Set to -1 if invalid.
      */
     int render_fd;
+
+    int x;
+    int y;
 } mpv_opengl_drm_params_v2;
 
 
