@@ -199,7 +199,7 @@ static int overlay_frame(struct ra_hwdec *hw, struct mp_image *hw_image,
                 drm_object_set_property(request,  p->ctx->video_plane, "CRTC_Y",  MP_ALIGN_DOWN(dy, 2));
                 drm_object_set_property(request,  p->ctx->video_plane, "CRTC_W",  dstw);
                 drm_object_set_property(request,  p->ctx->video_plane, "CRTC_H",  dsth);
-                drm_object_set_property(request,  p->ctx->video_plane, "ZPOS",    0);
+                drm_object_set_property(request,  p->ctx->video_plane, "ZPOS",    1);
             } else {
                 ret = drmModeSetPlane(p->ctx->fd, p->ctx->video_plane->id, p->ctx->crtc->id, next_frame.fb.fb_id, 0,
                                       MP_ALIGN_DOWN(dx, 2), MP_ALIGN_DOWN(dy, 2), dstw, dsth,
